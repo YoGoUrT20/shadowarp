@@ -61,29 +61,29 @@ function saveConfigToDisk() {
 
 const tempDir = path.join(app.getPath('userData'), 'shadowarp_buffers');
 const isDev = process.env.NODE_ENV !== 'production' && !app.isPackaged;
-const SEGMENT_DURATION = 5; // seconds per segment — smaller = more precise buffer timing
+const SEGMENT_DURATION = 10; // seconds per segment — balance between audio quality and buffer precision
 
 function ensureDir(dir: string) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
 function cleanOldSegments() {
-    const files = fs.readdirSync(tempDir).filter(f => f.endsWith('.ts'));
-    const now = Date.now();
-    // Keep segments for bufferTime + a few extra segments as safety margin
-    const maxAgeMs = parseInt(config.bufferTime) * 1000 + SEGMENT_DURATION * 3 * 1000;
+    try {
+        const files = fs.readdirSync(tempDir).filter(f => f.endsWith('.ts'));
+        const now = Date.now();
+        // Keep segments for bufferTime + generous margin
+        const maxAgeMs = parseInt(config.bufferTime) * 1000 + 60000;
 
-    files.forEach(file => {
-        const filePath = path.join(tempDir, file);
-        try {
-            const stats = fs.statSync(filePath);
-            if (now - stats.mtimeMs > maxAgeMs) {
-                fs.unlinkSync(filePath);
-            }
-        } catch (e) {
-            console.error(e);
-        }
-    });
+        files.forEach(file => {
+            const filePath = path.join(tempDir, file);
+            try {
+                const stats = fs.statSync(filePath);
+                if (now - stats.mtimeMs > maxAgeMs) {
+                    fs.unlinkSync(filePath);
+                }
+            } catch (e) { /* ignore */ }
+        });
+    } catch (e) { /* ignore */ }
 }
 
 function startRecording() {
@@ -117,7 +117,7 @@ function startRecording() {
         // System audio via stdin (pipe:0) — raw PCM from Electron renderer
         if (useSystemAudio) {
             args.push(
-                '-thread_queue_size', '4096',
+                '-thread_queue_size', '512',
                 '-f', 's16le',
                 '-ar', '48000',
                 '-ac', '2',
@@ -125,12 +125,13 @@ function startRecording() {
             );
         }
 
-        // Screen capture via gdigrab
+        // Screen capture via gdigrab — low queue to minimize latency
         args.push(
-            '-thread_queue_size', '1024',
+            '-thread_queue_size', '64',
             '-f', 'gdigrab',
             '-framerate', config.fps,
             '-draw_mouse', '1',
+            '-probesize', '32',
             '-i', 'desktop'
         );
 
@@ -151,7 +152,7 @@ function startRecording() {
         const micInputIndex = useSystemAudio ? 2 : 1;
 
         if (mappedMic && mappedMic !== 'None' && currentDevices.includes(mappedMic)) {
-            args.push('-thread_queue_size', '1024', '-f', 'dshow', '-i', `audio=${mappedMic}`);
+            args.push('-thread_queue_size', '256', '-f', 'dshow', '-i', `audio=${mappedMic}`);
             audioInputs++;
         }
 
@@ -175,7 +176,6 @@ function startRecording() {
         // audioInputs === 0: no audio mapping needed
 
         args.push(
-            '-vf', `fps=${config.fps}`,
             '-c:v', config.codec,
             ...(config.codec.includes('nvenc') ? ['-preset', 'p5'] : ['-preset', 'ultrafast']),
             '-b:v', `${config.bitrate}M`,
@@ -230,7 +230,7 @@ function startRecording() {
             }
         }
 
-        cleanupInterval = setInterval(cleanOldSegments, 15000);
+        cleanupInterval = setInterval(cleanOldSegments, 5000);
     });
 }
 
@@ -274,56 +274,44 @@ function saveReplay() {
 
     const bufferSecs = parseInt(config.bufferTime);
 
-    // Get all .ts segment files, sorted by filename (strftime = chronological order)
+    // Get all .ts segments sorted by name (chronological via strftime naming)
     const allFiles = fs.readdirSync(tempDir)
         .filter(f => f.endsWith('.ts'))
         .sort()
-        .map(f => {
-            const filePath = path.join(tempDir, f);
-            try {
-                const stats = fs.statSync(filePath);
-                return { filePath, size: stats.size };
-            } catch {
-                return null;
-            }
-        })
-        .filter((entry): entry is NonNullable<typeof entry> => entry !== null && entry.size > 0);
+        .map(f => path.join(tempDir, f));
 
     if (allFiles.length === 0) {
         new Notification({ title: 'ShadowWarp', body: 'No video buffered yet.' }).show();
         return;
     }
 
-    // Take enough segments to cover the buffer window + extra for trimming.
-    // We intentionally grab more than needed — the trim pass will cut to exact duration.
-    const segmentsNeeded = Math.ceil(bufferSecs / SEGMENT_DURATION) + 2;
-    const selectedFiles = allFiles.slice(-segmentsNeeded);
+    // Take only the last N segments to match the configured buffer time.
+    // Cleanup keeps extra segments as safety margin, but we only use what we need.
+    const segmentsNeeded = Math.ceil(bufferSecs / SEGMENT_DURATION);
+    const files = allFiles.slice(-segmentsNeeded);
 
     isSavingReplay = true;
 
     const concatListPath = path.join(tempDir, 'concat.txt');
-    const lines = selectedFiles.map(f => `file '${f.filePath.replace(/\\/g, '/')}'`);
+    const lines = files.map(f => `file '${f.replace(/\\/g, '/')}'`);
     fs.writeFileSync(concatListPath, lines.join('\n'));
 
     const outputFolder = config.outputFolder || app.getPath('videos');
     ensureDir(outputFolder);
-    const nowDate = new Date();
-    const formatTime = nowDate.toISOString().replace(/T/, '_').replace(/\..+/, '').replace(/:/g, '-');
+    const now = new Date();
+    const formatTime = now.toISOString().replace(/T/, '_').replace(/\..+/, '').replace(/:/g, '-');
     const outputFile = path.join(outputFolder, `ShadowWarp_Replay_${formatTime}.mp4`);
-    const tempConcatFile = path.join(tempDir, `temp_concat_${Date.now()}.mp4`);
 
-    console.log(`Saving replay: ${selectedFiles.length} segments (of ${allFiles.length} total), target=${bufferSecs}s`);
+    console.log(`Saving replay: ${files.length} segments`);
 
-    // ── PASS 1: Concatenate all selected segments into a single temp file ──
     let stderrOutput = '';
     const concatProcess = spawn(ffmpeg, [
         '-y',
-        '-fflags', '+genpts+igndts',
         '-f', 'concat',
         '-safe', '0',
         '-i', concatListPath,
         '-c', 'copy',
-        tempConcatFile
+        outputFile
     ]);
 
     concatProcess.stderr?.on('data', (d: Buffer) => {
@@ -336,70 +324,18 @@ function saveReplay() {
         new Notification({ title: 'ShadowWarp', body: `Failed to save replay: ${err.message}` }).show();
     });
 
-    concatProcess.on('exit', (concatCode) => {
-        if (concatCode !== 0) {
-            isSavingReplay = false;
-            console.error(`Concat failed with code ${concatCode}. stderr: ${stderrOutput}`);
-            new Notification({ title: 'ShadowWarp', body: `Failed to save replay. Code: ${concatCode}` }).show();
-            try { fs.unlinkSync(tempConcatFile); } catch { }
-            return;
+    concatProcess.on('exit', (code) => {
+        isSavingReplay = false;
+        if (code === 0) {
+            const notif = new Notification({ title: 'ShadowWarp', body: `Replay saved!\nClick to view in folder.` });
+            notif.on('click', () => {
+                shell.showItemInFolder(outputFile);
+            });
+            notif.show();
+        } else {
+            console.error(`Concat failed with code ${code}. stderr: ${stderrOutput}`);
+            new Notification({ title: 'ShadowWarp', body: `Failed to save replay. Code: ${code}` }).show();
         }
-
-        console.log('Pass 1 done (concat). Starting pass 2 (trim)...');
-
-        // ── PASS 2: Trim the temp file to exact buffer duration using -sseof ──
-        // -sseof on a normal .mp4 file is reliable (unlike on concat demuxer input)
-        let trimStderr = '';
-        const trimProcess = spawn(ffmpeg, [
-            '-y',
-            '-sseof', `-${bufferSecs}`,
-            '-i', tempConcatFile,
-            '-c', 'copy',
-            outputFile
-        ]);
-
-        trimProcess.stderr?.on('data', (d: Buffer) => {
-            trimStderr += d.toString();
-        });
-
-        trimProcess.on('error', (err) => {
-            console.error('Trim process error:', err);
-            isSavingReplay = false;
-            try { fs.unlinkSync(tempConcatFile); } catch { }
-            new Notification({ title: 'ShadowWarp', body: `Failed to trim replay: ${err.message}` }).show();
-        });
-
-        trimProcess.on('exit', (trimCode) => {
-            // Always clean up temp file
-            try { fs.unlinkSync(tempConcatFile); } catch { }
-
-            isSavingReplay = false;
-
-            if (trimCode === 0) {
-                // Verify output
-                try {
-                    const outStats = fs.statSync(outputFile);
-                    if (outStats.size < 1024) {
-                        console.error('Output file is too small, likely corrupt');
-                        new Notification({ title: 'ShadowWarp', body: 'Replay save failed: output file is empty.' }).show();
-                        try { fs.unlinkSync(outputFile); } catch { }
-                        return;
-                    }
-                } catch {
-                    new Notification({ title: 'ShadowWarp', body: 'Replay save failed: output file missing.' }).show();
-                    return;
-                }
-
-                const notif = new Notification({ title: 'ShadowWarp', body: `Replay saved!\nClick to view in folder.` });
-                notif.on('click', () => {
-                    shell.showItemInFolder(outputFile);
-                });
-                notif.show();
-            } else {
-                console.error(`Trim failed with code ${trimCode}. stderr: ${trimStderr}`);
-                new Notification({ title: 'ShadowWarp', body: `Failed to save replay. Code: ${trimCode}` }).show();
-            }
-        });
     });
 }
 
