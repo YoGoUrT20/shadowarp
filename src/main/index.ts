@@ -30,8 +30,12 @@ let tray: Tray | null = null;
 let isQuiting = false;
 let isRecording = false;
 let recordProcess: ChildProcess | null = null;
-let cleanupInterval: NodeJS.Timeout | null = null;
+let recordingStartTime = 0;
 let useSystemAudio = false;
+
+// New Memory Architecture for Replay Buffer
+let videoBuffer: { time: number, chunk: Buffer }[] = [];
+let totalBytes = 0;
 
 let config = {
     fps: '60',
@@ -61,46 +65,28 @@ function saveConfigToDisk() {
 
 const tempDir = path.join(app.getPath('userData'), 'shadowarp_buffers');
 const isDev = process.env.NODE_ENV !== 'production' && !app.isPackaged;
-const SEGMENT_DURATION = 10; // seconds per segment — balance between audio quality and buffer precision
+const BUFFER_FILE = path.join(tempDir, 'buffer.m3u8');
 
 function ensureDir(dir: string) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-function cleanOldSegments() {
-    try {
-        const files = fs.readdirSync(tempDir).filter(f => f.endsWith('.ts'));
-        const now = Date.now();
-        // Keep segments for bufferTime + generous margin
-        const maxAgeMs = parseInt(config.bufferTime) * 1000 + 60000;
-
-        files.forEach(file => {
-            const filePath = path.join(tempDir, file);
-            try {
-                const stats = fs.statSync(filePath);
-                if (now - stats.mtimeMs > maxAgeMs) {
-                    fs.unlinkSync(filePath);
-                }
-            } catch (e) { /* ignore */ }
-        });
-    } catch (e) { /* ignore */ }
-}
-
-function startRecording(skipCleanup = false) {
+function startRecording() {
     if (isRecording) return;
     ensureDir(tempDir);
 
-    if (!skipCleanup) {
-        const existingFiles = fs.readdirSync(tempDir);
-        existingFiles.forEach(f => {
-            try { fs.unlinkSync(path.join(tempDir, f)) } catch (ignored) { }
-        });
-    }
-
-    const timeFormat = "%Y%m%d%H%M%S";
+    // Clean up old buffer files if they exist
+    try {
+        if (fs.existsSync(tempDir)) {
+            const files = fs.readdirSync(tempDir);
+            for (const file of files) {
+                fs.unlinkSync(path.join(tempDir, file));
+            }
+        }
+    } catch (e) { /* ignore */ }
 
     const fetchDevices = () => new Promise<string[]>((resolve) => {
-        const proc = spawn(ffmpeg, ['-list_devices', 'true', '-f', 'dshow', '-i', 'dummy']);
+        const proc = spawn(ffmpeg, ['-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'], { windowsHide: true });
         let output = '';
         proc.stderr.on('data', d => output += d.toString());
         proc.on('close', () => {
@@ -116,13 +102,11 @@ function startRecording(skipCleanup = false) {
             '-y',
         ];
 
-        // System audio via stdin (pipe:0) — raw PCM from Electron renderer
+        // System audio via stdin (pipe:0) — WebM Opus stream from Electron renderer
         if (useSystemAudio) {
             args.push(
-                '-thread_queue_size', '512',
-                '-f', 's16le',
-                '-ar', '48000',
-                '-ac', '2',
+                '-thread_queue_size', '4096',
+                '-f', 'webm',
                 '-i', 'pipe:0'
             );
         }
@@ -131,7 +115,7 @@ function startRecording(skipCleanup = false) {
 
         // Screen capture via gdigrab
         args.push(
-            '-thread_queue_size', '512',
+            '-thread_queue_size', '4096',
             '-f', 'gdigrab',
             '-framerate', config.fps,
             '-draw_mouse', '1',
@@ -156,7 +140,7 @@ function startRecording(skipCleanup = false) {
         const micInputIndex = useSystemAudio ? 2 : 1;
 
         if (mappedMic && mappedMic !== 'None' && currentDevices.includes(mappedMic)) {
-            args.push('-thread_queue_size', '512', '-f', 'dshow', '-i', `audio=${mappedMic}`);
+            args.push('-thread_queue_size', '4096', '-f', 'dshow', '-i', `audio=${mappedMic}`);
             audioInputs++;
         }
 
@@ -165,14 +149,14 @@ function startRecording(skipCleanup = false) {
 
         if (audioInputs === 1 && useSystemAudio) {
             // Only system audio
-            args.push('-map', `${sysAudioInputIndex}:a`, '-c:a', 'aac', '-b:a', '256k', '-af', 'aresample=async=1');
+            args.push('-map', `${sysAudioInputIndex}:a`, '-c:a', 'aac', '-b:a', '256k');
         } else if (audioInputs === 1 && !useSystemAudio) {
             // Only mic
-            args.push('-map', `${micInputIndex}:a`, '-c:a', 'aac', '-b:a', '256k', '-af', 'aresample=async=1');
+            args.push('-map', `${micInputIndex}:a`, '-c:a', 'aac', '-b:a', '256k');
         } else if (audioInputs === 2) {
             // Both system audio and mic — mix them
             args.push(
-                '-filter_complex', `[${sysAudioInputIndex}:a][${micInputIndex}:a]amix=inputs=2:duration=longest,aresample=async=1[aout]`,
+                '-filter_complex', `[${sysAudioInputIndex}:a][${micInputIndex}:a]amix=inputs=2:duration=longest[aout]`,
                 '-map', '[aout]',
                 '-c:a', 'aac', '-b:a', '256k'
             );
@@ -186,25 +170,39 @@ function startRecording(skipCleanup = false) {
             '-b:v', `${config.bitrate}M`,
             // Force constant framerate — prevents variable timing that causes stutters
             '-vsync', 'cfr',
-            // GOP size: keyframe every 2 seconds so seeking/segment boundaries are clean
+            // GOP size: keyframe every 2 seconds
             '-g', String(fpsNum * 2),
-            // Force a keyframe exactly at every segment boundary
-            '-force_key_frames', `expr:gte(t,n_forced*${SEGMENT_DURATION})`,
-            // Segmented output
-            '-f', 'segment',
-            '-segment_time', String(SEGMENT_DURATION),
-            '-reset_timestamps', '1',
-            '-strftime', '1',
-            path.join(tempDir, `buffer_${timeFormat}.ts`)
+            // Output to TS pipe for memory streaming
+            '-f', 'mpegts',
+            '-mpegts_flags', '+resend_headers',
+            'pipe:1'
         );
 
         console.log(`Spawning ffmpeg with: `, args.join(' '));
+        recordingStartTime = Date.now();
         recordProcess = spawn(ffmpeg, args, {
-            stdio: useSystemAudio ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe']
+            stdio: useSystemAudio ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
+            windowsHide: true
+        });
+
+        videoBuffer = [];
+        totalBytes = 0;
+
+        recordProcess.stdout?.on('data', (chunk) => {
+            videoBuffer.push({ time: Date.now(), chunk });
+            totalBytes += chunk.length;
+
+            const bufferSecs = parseInt(config.bufferTime) || 300;
+            const cutoff = Date.now() - (bufferSecs + 15) * 1000;
+            const hardLimit = 2.5 * 1024 * 1024 * 1024; // 2.5 GB Safety Limit
+
+            while (videoBuffer.length > 2 && (videoBuffer[0].time < cutoff || totalBytes > hardLimit)) {
+                const removed = videoBuffer.shift();
+                if (removed) totalBytes -= removed.chunk.length;
+            }
         });
 
         recordProcess.stderr?.on('data', (data) => console.log('FFMPEG:', data.toString()));
-        recordProcess.stdout?.on('data', () => { }); // drain stdout
 
         // Attach error handler on stdin to prevent EPIPE from crashing the app
         // This MUST be set before any writes, otherwise an async write error is uncaught
@@ -214,12 +212,7 @@ function startRecording(skipCleanup = false) {
             });
         }
 
-        // Write initial silence to stdin so FFmpeg doesn't block waiting for data
-        // 48000 samples/sec * 2 channels * 2 bytes (s16le) = 192000 bytes per second
-        if (useSystemAudio && recordProcess.stdin && !recordProcess.stdin.destroyed) {
-            const silenceBuffer = Buffer.alloc(192000, 0); // 1 second of silence
-            recordProcess.stdin.write(silenceBuffer);
-        }
+
 
         recordProcess.on('exit', (code) => {
             console.log('FFmpeg exited with code:', code);
@@ -242,8 +235,6 @@ function startRecording(skipCleanup = false) {
                 mainWindow.webContents.send('start-system-audio');
             }
         }
-
-        cleanupInterval = setInterval(cleanOldSegments, 5000);
     });
 }
 
@@ -260,7 +251,6 @@ function stopRecording() {
         try { recordProcess.stdin?.end(); } catch (e) { /* ignore */ }
         // Send SIGINT for graceful shutdown (equivalent to pressing 'q')
         try { recordProcess.kill('SIGINT'); } catch (e) { /* ignore */ }
-        if (cleanupInterval) clearInterval(cleanupInterval);
         setTimeout(() => {
             if (recordProcess) {
                 try { recordProcess.kill('SIGKILL'); } catch (e) { /* ignore */ }
@@ -285,70 +275,71 @@ function saveReplay() {
         return;
     }
 
-    isSavingReplay = true;
+    // Check that the buffer array has some content
+    if (videoBuffer.length === 0) {
+        new Notification({ title: 'ShadowWarp', body: 'No video buffered yet.' }).show();
+        return;
+    }
+    if (totalBytes < 1024) {
+        new Notification({ title: 'ShadowWarp', body: 'Not enough video buffered yet.' }).show();
+        return;
+    }
 
     const bufferSecs = parseInt(config.bufferTime);
+    isSavingReplay = true;
 
-    // ── Flush the current segment ──
-    // FFmpeg's segment muxer keeps the current segment open until the next
-    // segment boundary.  That means the most recent ~SEGMENT_DURATION seconds
-    // are still in FFmpeg's internal buffer and NOT yet on disk.
-    // To capture everything up to the save-moment we gracefully stop FFmpeg
-    // (which finalizes the active segment), collect segments, concat, then
-    // restart recording.
+    const outputFolder = config.outputFolder || app.getPath('videos');
+    ensureDir(outputFolder);
+    const now = new Date();
+    const formatTime = now.toISOString().replace(/T/, '_').replace(/\..+/, '').replace(/:/g, '-');
+    const outputFile = path.join(outputFolder, `ShadowWarp_Replay_${formatTime}.mp4`);
 
-    const doSaveAfterFlush = () => {
-        const allFiles = fs.readdirSync(tempDir)
-            .filter(f => f.endsWith('.ts'))
-            .sort()
-            .map(f => path.join(tempDir, f));
+    console.log(`Saving replay: extracting exact ${bufferSecs}s from memory buffer`);
 
-        if (allFiles.length === 0) {
-            isSavingReplay = false;
-            new Notification({ title: 'ShadowWarp', body: 'No video buffered yet.' }).show();
-            // Restart recording even if nothing was saved
-            startRecording(true);
-            return;
+    const tempDump = path.join(tempDir, `dump_${Date.now()}.ts`);
+    const chunksCopy = videoBuffer.map(v => v.chunk);
+
+    // Async piped write avoids electron freeze on large buffers
+    const writeStream = fs.createWriteStream(tempDump);
+    let i = 0;
+
+    const writeNext = () => {
+        let isFlushed = true;
+        while (i < chunksCopy.length && isFlushed) {
+            isFlushed = writeStream.write(chunksCopy[i++]);
         }
+        if (i < chunksCopy.length) {
+            writeStream.once('drain', writeNext);
+        } else {
+            writeStream.end();
+        }
+    };
 
-        const segmentsNeeded = Math.ceil(bufferSecs / SEGMENT_DURATION);
-        const files = allFiles.slice(-segmentsNeeded);
-
-        const concatListPath = path.join(tempDir, 'concat.txt');
-        const lines = files.map(f => `file '${f.replace(/\\/g, '/')}'`);
-        fs.writeFileSync(concatListPath, lines.join('\n'));
-
-        const outputFolder = config.outputFolder || app.getPath('videos');
-        ensureDir(outputFolder);
-        const now = new Date();
-        const formatTime = now.toISOString().replace(/T/, '_').replace(/\..+/, '').replace(/:/g, '-');
-        const outputFile = path.join(outputFolder, `ShadowWarp_Replay_${formatTime}.mp4`);
-
-        console.log(`Saving replay: ${files.length} segments`);
-
+    writeStream.on('finish', () => {
         let stderrOutput = '';
-        const concatProcess = spawn(ffmpeg, [
+        const extractProcess = spawn(ffmpeg, [
             '-y',
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', concatListPath,
+            '-sseof', `-${bufferSecs}`,
+            '-i', tempDump,
             '-c', 'copy',
+            '-movflags', '+faststart',
             outputFile
-        ]);
+        ], { windowsHide: true });
 
-        concatProcess.stderr?.on('data', (d: Buffer) => {
+        extractProcess.stderr?.on('data', (d: Buffer) => {
             stderrOutput += d.toString();
         });
 
-        concatProcess.on('error', (err) => {
-            console.error('Concat process error:', err);
+        extractProcess.on('error', (err) => {
+            console.error('Extract process error:', err);
             isSavingReplay = false;
+            try { if (fs.existsSync(tempDump)) fs.unlinkSync(tempDump); } catch (e) { }
             new Notification({ title: 'ShadowWarp', body: `Failed to save replay: ${err.message}` }).show();
-            startRecording(true);
         });
 
-        concatProcess.on('exit', (code) => {
+        extractProcess.on('exit', (code) => {
             isSavingReplay = false;
+            try { if (fs.existsSync(tempDump)) fs.unlinkSync(tempDump); } catch (e) { }
             if (code === 0) {
                 const notif = new Notification({ title: 'ShadowWarp', body: `Replay saved!\nClick to view in folder.` });
                 notif.on('click', () => {
@@ -356,58 +347,13 @@ function saveReplay() {
                 });
                 notif.show();
             } else {
-                console.error(`Concat failed with code ${code}. stderr: ${stderrOutput}`);
+                console.error(`Extract failed with code ${code}. stderr: ${stderrOutput}`);
                 new Notification({ title: 'ShadowWarp', body: `Failed to save replay. Code: ${code}` }).show();
             }
-            // Restart recording after concat finishes
-            startRecording(true);
         });
-    };
+    });
 
-    // Gracefully stop FFmpeg so it finalizes the current segment to disk.
-    // We must NOT delete existing segment files (startRecording normally does),
-    // so we gate the cleanup with a flag.
-    if (recordProcess) {
-        console.log('Flushing current segment by stopping FFmpeg...');
-
-        // Tell renderer to stop sending audio
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('stop-system-audio');
-        }
-
-        const proc = recordProcess;
-        recordProcess = null;
-
-        // Clear cleanup interval to prevent segment deletion during save
-        if (cleanupInterval) {
-            clearInterval(cleanupInterval);
-            cleanupInterval = null;
-        }
-
-        // Listen for FFmpeg exit, then proceed with save
-        proc.once('exit', () => {
-            console.log('FFmpeg stopped — current segment flushed to disk.');
-            isRecording = false;
-            useSystemAudio = false;
-            if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send('recording-state', false);
-            }
-            // Small delay to ensure the OS has finished writing the file
-            setTimeout(doSaveAfterFlush, 300);
-        });
-
-        // Close stdin to signal EOF, then send SIGINT for graceful shutdown
-        try { proc.stdin?.end(); } catch (e) { /* ignore */ }
-        try { proc.kill('SIGINT'); } catch (e) { /* ignore */ }
-
-        // Safety: force-kill after 5s if FFmpeg hangs
-        setTimeout(() => {
-            try { proc.kill('SIGKILL'); } catch (e) { /* ignore */ }
-        }, 5000);
-    } else {
-        // No active recording process — just save whatever segments exist
-        doSaveAfterFlush();
-    }
+    writeNext();
 }
 
 function createWindow() {
@@ -416,7 +362,8 @@ function createWindow() {
         height: 600,
         webPreferences: {
             preload: path.join(__dirname, '..', 'preload', 'index.js'),
-            contextIsolation: true
+            contextIsolation: true,
+            backgroundThrottling: false
         },
         show: !process.argv.includes('--hidden'),
         frame: false,
@@ -575,7 +522,7 @@ ipcMain.on('system-audio-data', (_e, buffer: Buffer) => {
 
 ipcMain.handle('get-audio-devices', () => {
     return new Promise((resolve) => {
-        const proc = spawn(ffmpeg, ['-list_devices', 'true', '-f', 'dshow', '-i', 'dummy']);
+        const proc = spawn(ffmpeg, ['-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'], { windowsHide: true });
         let output = '';
         proc.stderr.on('data', d => output += d.toString());
         proc.on('close', () => {
@@ -585,7 +532,7 @@ ipcMain.handle('get-audio-devices', () => {
     });
 });
 
-ipcMain.handle('start-recording', () => startRecording());
+ipcMain.handle('start-recording', startRecording);
 ipcMain.handle('stop-recording', stopRecording);
 ipcMain.handle('save-replay', saveReplay);
 ipcMain.handle('select-folder', async () => {

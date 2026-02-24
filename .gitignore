@@ -36,3 +36,5 @@ dist
 /release
 *.txt
 /ffmpeg-full
+*.ts
+*.mp4
