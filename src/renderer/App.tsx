@@ -65,8 +65,14 @@ export default function App() {
     const sysAudioCtxRef = useRef<AudioContext | null>(null);
     const sysAudioStreamRef = useRef<MediaStream | null>(null);
     const sysAudioProcessorRef = useRef<ScriptProcessorNode | null>(null);
+    const sysAudioWorkletRef = useRef<AudioWorkletNode | null>(null);
 
     const stopSystemAudioCapture = () => {
+        if (sysAudioWorkletRef.current) {
+            sysAudioWorkletRef.current.port.close();
+            sysAudioWorkletRef.current.disconnect();
+            sysAudioWorkletRef.current = null;
+        }
         if (sysAudioProcessorRef.current) {
             sysAudioProcessorRef.current.disconnect();
             sysAudioProcessorRef.current = null;
@@ -110,36 +116,116 @@ export default function App() {
 
             const source = audioCtx.createMediaStreamSource(new MediaStream(audioTracks));
 
-            // ScriptProcessorNode to get raw PCM samples
-            // Buffer size 4096 is a good balance between latency and performance
-            const processor = audioCtx.createScriptProcessor(4096, 2, 2);
-            sysAudioProcessorRef.current = processor;
+            // Try AudioWorkletNode first (real-time thread, no dropouts),
+            // fall back to ScriptProcessorNode if unavailable
+            try {
+                // AudioWorklet processor runs on a dedicated real-time audio thread.
+                // It batches ~100ms of samples before posting to reduce IPC overhead.
+                const workletCode = `
+class PCMForwardProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this._chunks = [];
+        this._samplesAccumulated = 0;
+        // Batch ~100ms of audio before sending (48000 * 0.1 = 4800 samples)
+        this._sendThreshold = 4800;
+    }
 
-            processor.onaudioprocess = (e) => {
-                if (!window.api) return;
-                const left = e.inputBuffer.getChannelData(0);
-                const right = e.inputBuffer.getChannelData(1);
+    process(inputs) {
+        const input = inputs[0];
+        if (!input || input.length < 1) return true;
 
-                // Convert Float32 stereo to interleaved Int16 PCM
-                const pcm = new Int16Array(left.length * 2);
-                for (let i = 0; i < left.length; i++) {
-                    pcm[i * 2] = Math.max(-32768, Math.min(32767, Math.round(left[i] * 32767)));
-                    pcm[i * 2 + 1] = Math.max(-32768, Math.min(32767, Math.round(right[i] * 32767)));
-                }
+        const left = input[0];
+        const right = input.length > 1 ? input[1] : left;
+        const len = left.length;
 
-                window.api.sendSystemAudioData(pcm.buffer);
-            };
+        // Convert Float32 to interleaved Int16 PCM (s16le)
+        const pcm = new Int16Array(len * 2);
+        for (let i = 0; i < len; i++) {
+            pcm[i * 2]     = Math.max(-32768, Math.min(32767, (left[i] * 32767) | 0));
+            pcm[i * 2 + 1] = Math.max(-32768, Math.min(32767, (right[i] * 32767) | 0));
+        }
 
-            // Route: source -> processor -> gainNode(muted) -> destination
-            // The processor must be connected to a destination to process audio,
-            // but we use a zero-gain node so the user doesn't hear echo
-            const gainNode = audioCtx.createGain();
-            gainNode.gain.value = 0;
-            source.connect(processor);
-            processor.connect(gainNode);
-            gainNode.connect(audioCtx.destination);
+        this._chunks.push(pcm);
+        this._samplesAccumulated += len;
 
-            console.log('[SysAudio] Capture started successfully');
+        if (this._samplesAccumulated >= this._sendThreshold) {
+            // Merge accumulated chunks into a single buffer
+            const totalLen = this._chunks.reduce((s, c) => s + c.length, 0);
+            const merged = new Int16Array(totalLen);
+            let off = 0;
+            for (const c of this._chunks) {
+                merged.set(c, off);
+                off += c.length;
+            }
+            // Transfer the buffer (zero-copy) to the main thread
+            this.port.postMessage(merged.buffer, [merged.buffer]);
+            this._chunks = [];
+            this._samplesAccumulated = 0;
+        }
+
+        return true;
+    }
+}
+
+registerProcessor('pcm-forward-processor', PCMForwardProcessor);
+`;
+                const blob = new Blob([workletCode], { type: 'application/javascript' });
+                const workletUrl = URL.createObjectURL(blob);
+                await audioCtx.audioWorklet.addModule(workletUrl);
+                URL.revokeObjectURL(workletUrl);
+
+                const workletNode = new AudioWorkletNode(audioCtx, 'pcm-forward-processor', {
+                    numberOfInputs: 1,
+                    numberOfOutputs: 1,
+                    channelCount: 2
+                });
+                sysAudioWorkletRef.current = workletNode;
+
+                workletNode.port.onmessage = (e: MessageEvent) => {
+                    if (window.api) {
+                        window.api.sendSystemAudioData(e.data as ArrayBuffer);
+                    }
+                };
+
+                source.connect(workletNode);
+                // Worklet must be connected to destination to keep processing,
+                // but we use a zero-gain node so the user doesn't hear echo
+                const gainNode = audioCtx.createGain();
+                gainNode.gain.value = 0;
+                workletNode.connect(gainNode);
+                gainNode.connect(audioCtx.destination);
+
+                console.log('[SysAudio] Capture started with AudioWorklet (real-time thread)');
+            } catch (workletErr) {
+                console.warn('[SysAudio] AudioWorklet unavailable, falling back to ScriptProcessor:', workletErr);
+
+                // Fallback: ScriptProcessorNode (deprecated, runs on main thread)
+                const processor = audioCtx.createScriptProcessor(4096, 2, 2);
+                sysAudioProcessorRef.current = processor;
+
+                processor.onaudioprocess = (e) => {
+                    if (!window.api) return;
+                    const left = e.inputBuffer.getChannelData(0);
+                    const right = e.inputBuffer.getChannelData(1);
+
+                    const pcm = new Int16Array(left.length * 2);
+                    for (let i = 0; i < left.length; i++) {
+                        pcm[i * 2] = Math.max(-32768, Math.min(32767, Math.round(left[i] * 32767)));
+                        pcm[i * 2 + 1] = Math.max(-32768, Math.min(32767, Math.round(right[i] * 32767)));
+                    }
+
+                    window.api.sendSystemAudioData(pcm.buffer);
+                };
+
+                const gainNode = audioCtx.createGain();
+                gainNode.gain.value = 0;
+                source.connect(processor);
+                processor.connect(gainNode);
+                gainNode.connect(audioCtx.destination);
+
+                console.log('[SysAudio] Capture started with ScriptProcessor (fallback)');
+            }
         } catch (err) {
             console.error('[SysAudio] Failed to start capture:', err);
         }

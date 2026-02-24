@@ -125,13 +125,15 @@ function startRecording() {
             );
         }
 
-        // Screen capture via gdigrab — low queue to minimize latency
+        const fpsNum = parseInt(config.fps) || 60;
+
+        // Screen capture via gdigrab
         args.push(
-            '-thread_queue_size', '64',
+            '-thread_queue_size', '512',
             '-f', 'gdigrab',
             '-framerate', config.fps,
             '-draw_mouse', '1',
-            '-probesize', '32',
+            '-probesize', '10M',
             '-i', 'desktop'
         );
 
@@ -152,7 +154,7 @@ function startRecording() {
         const micInputIndex = useSystemAudio ? 2 : 1;
 
         if (mappedMic && mappedMic !== 'None' && currentDevices.includes(mappedMic)) {
-            args.push('-thread_queue_size', '256', '-f', 'dshow', '-i', `audio=${mappedMic}`);
+            args.push('-thread_queue_size', '512', '-f', 'dshow', '-i', `audio=${mappedMic}`);
             audioInputs++;
         }
 
@@ -161,26 +163,35 @@ function startRecording() {
 
         if (audioInputs === 1 && useSystemAudio) {
             // Only system audio
-            args.push('-map', `${sysAudioInputIndex}:a`, '-c:a', 'aac', '-b:a', '192k', '-af', 'aresample=async=1');
+            args.push('-map', `${sysAudioInputIndex}:a`, '-c:a', 'aac', '-b:a', '256k', '-af', 'aresample=async=1');
         } else if (audioInputs === 1 && !useSystemAudio) {
             // Only mic
-            args.push('-map', `${micInputIndex}:a`, '-c:a', 'aac', '-b:a', '192k', '-af', 'aresample=async=1');
+            args.push('-map', `${micInputIndex}:a`, '-c:a', 'aac', '-b:a', '256k', '-af', 'aresample=async=1');
         } else if (audioInputs === 2) {
             // Both system audio and mic — mix them
             args.push(
                 '-filter_complex', `[${sysAudioInputIndex}:a][${micInputIndex}:a]amix=inputs=2:duration=longest,aresample=async=1[aout]`,
                 '-map', '[aout]',
-                '-c:a', 'aac', '-b:a', '192k'
+                '-c:a', 'aac', '-b:a', '256k'
             );
         }
         // audioInputs === 0: no audio mapping needed
 
         args.push(
+            // Video encoding
             '-c:v', config.codec,
             ...(config.codec.includes('nvenc') ? ['-preset', 'p5'] : ['-preset', 'ultrafast']),
             '-b:v', `${config.bitrate}M`,
+            // Force constant framerate — prevents variable timing that causes stutters
+            '-vsync', 'cfr',
+            // GOP size: keyframe every 2 seconds so seeking/segment boundaries are clean
+            '-g', String(fpsNum * 2),
+            // Force a keyframe exactly at every segment boundary
+            '-force_key_frames', `expr:gte(t,n_forced*${SEGMENT_DURATION})`,
+            // Segmented output
             '-f', 'segment',
             '-segment_time', String(SEGMENT_DURATION),
+            '-reset_timestamps', '1',
             '-strftime', '1',
             path.join(tempDir, `buffer_${timeFormat}.ts`)
         );
