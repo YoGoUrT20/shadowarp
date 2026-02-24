@@ -65,6 +65,9 @@ function saveConfigToDisk() {
 
 const tempDir = path.join(app.getPath('userData'), 'shadowarp_buffers');
 const isDev = process.env.NODE_ENV !== 'production' && !app.isPackaged;
+const iconPath = isDev
+    ? path.join(__dirname, '..', '..', 'public', 'icon.png')
+    : path.join(__dirname, '..', '..', 'dist', 'icon.png');
 const BUFFER_FILE = path.join(tempDir, 'buffer.m3u8');
 
 function ensureDir(dir: string) {
@@ -279,11 +282,11 @@ function saveReplay() {
 
     // Check that the buffer array has some content
     if (videoBuffer.length === 0) {
-        new Notification({ title: 'ShadowWarp', body: 'No video buffered yet.' }).show();
+        new Notification({ title: 'ShadowWarp', body: 'No video buffered yet.', icon: iconPath }).show();
         return;
     }
     if (totalBytes < 1024) {
-        new Notification({ title: 'ShadowWarp', body: 'Not enough video buffered yet.' }).show();
+        new Notification({ title: 'ShadowWarp', body: 'Not enough video buffered yet.', icon: iconPath }).show();
         return;
     }
 
@@ -336,21 +339,21 @@ function saveReplay() {
             console.error('Extract process error:', err);
             isSavingReplay = false;
             try { if (fs.existsSync(tempDump)) fs.unlinkSync(tempDump); } catch (e) { }
-            new Notification({ title: 'ShadowWarp', body: `Failed to save replay: ${err.message}` }).show();
+            new Notification({ title: 'ShadowWarp', body: `Failed to save replay: ${err.message}`, icon: iconPath }).show();
         });
 
         extractProcess.on('exit', (code) => {
             isSavingReplay = false;
             try { if (fs.existsSync(tempDump)) fs.unlinkSync(tempDump); } catch (e) { }
             if (code === 0) {
-                const notif = new Notification({ title: 'ShadowWarp', body: `Replay saved!\nClick to view in folder.` });
+                const notif = new Notification({ title: 'ShadowWarp', body: `Replay saved!\nClick to view in folder.`, icon: iconPath });
                 notif.on('click', () => {
                     shell.showItemInFolder(outputFile);
                 });
                 notif.show();
             } else {
                 console.error(`Extract failed with code ${code}. stderr: ${stderrOutput}`);
-                new Notification({ title: 'ShadowWarp', body: `Failed to save replay. Code: ${code}` }).show();
+                new Notification({ title: 'ShadowWarp', body: `Failed to save replay. Code: ${code}`, icon: iconPath }).show();
             }
         });
     });
@@ -359,6 +362,8 @@ function saveReplay() {
 }
 
 function createWindow() {
+    const isHidden = process.argv.includes('--hidden');
+
     mainWindow = new BrowserWindow({
         width: 900,
         height: 600,
@@ -367,11 +372,15 @@ function createWindow() {
             contextIsolation: true,
             backgroundThrottling: false
         },
-        show: !process.argv.includes('--hidden'),
+        show: true, // MUST remain true to prevent Chromium MediaRecorder suspension
+        opacity: isHidden ? 0 : 1,
+        skipTaskbar: isHidden,
         frame: false,
         transparent: true,
         backgroundColor: '#00000000'
     });
+
+    if (isHidden) mainWindow.setIgnoreMouseEvents(true);
 
     const url = isDev
         ? "http://localhost:3000"
@@ -391,17 +400,16 @@ function createWindow() {
     mainWindow.on('close', (event) => {
         if (!isQuiting) {
             event.preventDefault();
-            mainWindow?.hide();
-            new Notification({ title: 'ShadowWarp', body: 'Running in background. Check System Tray' }).show();
+            // DO NOT USE .hide() as it suspends MediaRecorder on modern Chromium
+            mainWindow?.setOpacity(0);
+            mainWindow?.setSkipTaskbar(true);
+            mainWindow?.setIgnoreMouseEvents(true);
+            new Notification({ title: 'ShadowWarp', body: 'Running in background. Check System Tray', icon: iconPath }).show();
         }
     });
 }
 
 function createTray() {
-    const iconPath = isDev
-        ? path.join(__dirname, '..', '..', 'public', 'icon.png')
-        : path.join(__dirname, '..', '..', 'dist', 'icon.png');
-
     let icon = nativeImage.createFromPath(iconPath);
     // As a fallback to prevent crash if nativeImage is empty on some systems, we pass the icon instance directly.
     tray = new Tray(icon);
@@ -409,6 +417,9 @@ function createTray() {
     const contextMenu = Menu.buildFromTemplate([
         {
             label: 'Show App', click: () => {
+                mainWindow?.setOpacity(1);
+                mainWindow?.setSkipTaskbar(false);
+                mainWindow?.setIgnoreMouseEvents(false);
                 mainWindow?.show();
                 mainWindow?.focus();
             }
@@ -426,6 +437,9 @@ function createTray() {
     tray.setContextMenu(contextMenu);
 
     tray.on('click', () => {
+        mainWindow?.setOpacity(1);
+        mainWindow?.setSkipTaskbar(false);
+        mainWindow?.setIgnoreMouseEvents(false);
         mainWindow?.show();
         mainWindow?.focus();
     });
@@ -557,8 +571,14 @@ ipcMain.handle('window-control', (e, action) => {
             else win.maximize();
             break;
         case 'close':
-            win.close();
-            // In our implementation this goes to hide() unless isQuiting is true
+            if (!isQuiting) {
+                win.setOpacity(0);
+                win.setSkipTaskbar(true);
+                win.setIgnoreMouseEvents(true);
+                new Notification({ title: 'ShadowWarp', body: 'Running in background. Check System Tray', icon: iconPath }).show();
+            } else {
+                win.close();
+            }
             break;
     }
 });
