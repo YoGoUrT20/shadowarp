@@ -113,14 +113,14 @@ function startRecording() {
 
         const fpsNum = parseInt(config.fps) || 60;
 
-        // Screen capture via gdigrab
+        // Screen capture via ddagrab (Desktop Duplication API) - native DXGI
+        // Solves the blinking cursor bug inherent to Windows GDI capture.
         args.push(
+            '-init_hw_device', 'd3d11va=dx11',
+            '-filter_hw_device', 'dx11',
             '-thread_queue_size', '4096',
-            '-f', 'gdigrab',
-            '-framerate', config.fps,
-            '-draw_mouse', '1',
-            '-probesize', '10M',
-            '-i', 'desktop'
+            '-f', 'lavfi',
+            '-i', `ddagrab=framerate=${fpsNum}:draw_mouse=1`
         );
 
         let audioInputs = 0;
@@ -164,6 +164,8 @@ function startRecording() {
         // audioInputs === 0: no audio mapping needed
 
         args.push(
+            // Hardware translation of pure DXGI frames back to standard colorspace for universal encoder compat
+            '-vf', 'hwdownload,format=bgra',
             // Video encoding
             '-c:v', config.codec,
             ...(config.codec.includes('nvenc') ? ['-preset', 'p5'] : ['-preset', 'ultrafast']),
