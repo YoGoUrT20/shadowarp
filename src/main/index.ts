@@ -86,14 +86,16 @@ function cleanOldSegments() {
     } catch (e) { /* ignore */ }
 }
 
-function startRecording() {
+function startRecording(skipCleanup = false) {
     if (isRecording) return;
     ensureDir(tempDir);
 
-    const existingFiles = fs.readdirSync(tempDir);
-    existingFiles.forEach(f => {
-        try { fs.unlinkSync(path.join(tempDir, f)) } catch (ignored) { }
-    });
+    if (!skipCleanup) {
+        const existingFiles = fs.readdirSync(tempDir);
+        existingFiles.forEach(f => {
+            try { fs.unlinkSync(path.join(tempDir, f)) } catch (ignored) { }
+        });
+    }
 
     const timeFormat = "%Y%m%d%H%M%S";
 
@@ -283,71 +285,129 @@ function saveReplay() {
         return;
     }
 
-    const bufferSecs = parseInt(config.bufferTime);
-
-    // Get all .ts segments sorted by name (chronological via strftime naming)
-    const allFiles = fs.readdirSync(tempDir)
-        .filter(f => f.endsWith('.ts'))
-        .sort()
-        .map(f => path.join(tempDir, f));
-
-    if (allFiles.length === 0) {
-        new Notification({ title: 'ShadowWarp', body: 'No video buffered yet.' }).show();
-        return;
-    }
-
-    // Take only the last N segments to match the configured buffer time.
-    // Cleanup keeps extra segments as safety margin, but we only use what we need.
-    const segmentsNeeded = Math.ceil(bufferSecs / SEGMENT_DURATION);
-    const files = allFiles.slice(-segmentsNeeded);
-
     isSavingReplay = true;
 
-    const concatListPath = path.join(tempDir, 'concat.txt');
-    const lines = files.map(f => `file '${f.replace(/\\/g, '/')}'`);
-    fs.writeFileSync(concatListPath, lines.join('\n'));
+    const bufferSecs = parseInt(config.bufferTime);
 
-    const outputFolder = config.outputFolder || app.getPath('videos');
-    ensureDir(outputFolder);
-    const now = new Date();
-    const formatTime = now.toISOString().replace(/T/, '_').replace(/\..+/, '').replace(/:/g, '-');
-    const outputFile = path.join(outputFolder, `ShadowWarp_Replay_${formatTime}.mp4`);
+    // ── Flush the current segment ──
+    // FFmpeg's segment muxer keeps the current segment open until the next
+    // segment boundary.  That means the most recent ~SEGMENT_DURATION seconds
+    // are still in FFmpeg's internal buffer and NOT yet on disk.
+    // To capture everything up to the save-moment we gracefully stop FFmpeg
+    // (which finalizes the active segment), collect segments, concat, then
+    // restart recording.
 
-    console.log(`Saving replay: ${files.length} segments`);
+    const doSaveAfterFlush = () => {
+        const allFiles = fs.readdirSync(tempDir)
+            .filter(f => f.endsWith('.ts'))
+            .sort()
+            .map(f => path.join(tempDir, f));
 
-    let stderrOutput = '';
-    const concatProcess = spawn(ffmpeg, [
-        '-y',
-        '-f', 'concat',
-        '-safe', '0',
-        '-i', concatListPath,
-        '-c', 'copy',
-        outputFile
-    ]);
-
-    concatProcess.stderr?.on('data', (d: Buffer) => {
-        stderrOutput += d.toString();
-    });
-
-    concatProcess.on('error', (err) => {
-        console.error('Concat process error:', err);
-        isSavingReplay = false;
-        new Notification({ title: 'ShadowWarp', body: `Failed to save replay: ${err.message}` }).show();
-    });
-
-    concatProcess.on('exit', (code) => {
-        isSavingReplay = false;
-        if (code === 0) {
-            const notif = new Notification({ title: 'ShadowWarp', body: `Replay saved!\nClick to view in folder.` });
-            notif.on('click', () => {
-                shell.showItemInFolder(outputFile);
-            });
-            notif.show();
-        } else {
-            console.error(`Concat failed with code ${code}. stderr: ${stderrOutput}`);
-            new Notification({ title: 'ShadowWarp', body: `Failed to save replay. Code: ${code}` }).show();
+        if (allFiles.length === 0) {
+            isSavingReplay = false;
+            new Notification({ title: 'ShadowWarp', body: 'No video buffered yet.' }).show();
+            // Restart recording even if nothing was saved
+            startRecording(true);
+            return;
         }
-    });
+
+        const segmentsNeeded = Math.ceil(bufferSecs / SEGMENT_DURATION);
+        const files = allFiles.slice(-segmentsNeeded);
+
+        const concatListPath = path.join(tempDir, 'concat.txt');
+        const lines = files.map(f => `file '${f.replace(/\\/g, '/')}'`);
+        fs.writeFileSync(concatListPath, lines.join('\n'));
+
+        const outputFolder = config.outputFolder || app.getPath('videos');
+        ensureDir(outputFolder);
+        const now = new Date();
+        const formatTime = now.toISOString().replace(/T/, '_').replace(/\..+/, '').replace(/:/g, '-');
+        const outputFile = path.join(outputFolder, `ShadowWarp_Replay_${formatTime}.mp4`);
+
+        console.log(`Saving replay: ${files.length} segments`);
+
+        let stderrOutput = '';
+        const concatProcess = spawn(ffmpeg, [
+            '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', concatListPath,
+            '-c', 'copy',
+            outputFile
+        ]);
+
+        concatProcess.stderr?.on('data', (d: Buffer) => {
+            stderrOutput += d.toString();
+        });
+
+        concatProcess.on('error', (err) => {
+            console.error('Concat process error:', err);
+            isSavingReplay = false;
+            new Notification({ title: 'ShadowWarp', body: `Failed to save replay: ${err.message}` }).show();
+            startRecording(true);
+        });
+
+        concatProcess.on('exit', (code) => {
+            isSavingReplay = false;
+            if (code === 0) {
+                const notif = new Notification({ title: 'ShadowWarp', body: `Replay saved!\nClick to view in folder.` });
+                notif.on('click', () => {
+                    shell.showItemInFolder(outputFile);
+                });
+                notif.show();
+            } else {
+                console.error(`Concat failed with code ${code}. stderr: ${stderrOutput}`);
+                new Notification({ title: 'ShadowWarp', body: `Failed to save replay. Code: ${code}` }).show();
+            }
+            // Restart recording after concat finishes
+            startRecording(true);
+        });
+    };
+
+    // Gracefully stop FFmpeg so it finalizes the current segment to disk.
+    // We must NOT delete existing segment files (startRecording normally does),
+    // so we gate the cleanup with a flag.
+    if (recordProcess) {
+        console.log('Flushing current segment by stopping FFmpeg...');
+
+        // Tell renderer to stop sending audio
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('stop-system-audio');
+        }
+
+        const proc = recordProcess;
+        recordProcess = null;
+
+        // Clear cleanup interval to prevent segment deletion during save
+        if (cleanupInterval) {
+            clearInterval(cleanupInterval);
+            cleanupInterval = null;
+        }
+
+        // Listen for FFmpeg exit, then proceed with save
+        proc.once('exit', () => {
+            console.log('FFmpeg stopped — current segment flushed to disk.');
+            isRecording = false;
+            useSystemAudio = false;
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('recording-state', false);
+            }
+            // Small delay to ensure the OS has finished writing the file
+            setTimeout(doSaveAfterFlush, 300);
+        });
+
+        // Close stdin to signal EOF, then send SIGINT for graceful shutdown
+        try { proc.stdin?.end(); } catch (e) { /* ignore */ }
+        try { proc.kill('SIGINT'); } catch (e) { /* ignore */ }
+
+        // Safety: force-kill after 5s if FFmpeg hangs
+        setTimeout(() => {
+            try { proc.kill('SIGKILL'); } catch (e) { /* ignore */ }
+        }, 5000);
+    } else {
+        // No active recording process — just save whatever segments exist
+        doSaveAfterFlush();
+    }
 }
 
 function createWindow() {
@@ -525,7 +585,7 @@ ipcMain.handle('get-audio-devices', () => {
     });
 });
 
-ipcMain.handle('start-recording', startRecording);
+ipcMain.handle('start-recording', () => startRecording());
 ipcMain.handle('stop-recording', stopRecording);
 ipcMain.handle('save-replay', saveReplay);
 ipcMain.handle('select-folder', async () => {
