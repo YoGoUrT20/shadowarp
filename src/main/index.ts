@@ -193,9 +193,12 @@ function startRecording() {
         videoBuffer = [];
         totalBytes = 0;
 
-        recordProcess.stdout?.on('data', (chunk) => {
-            videoBuffer.push({ time: Date.now(), chunk });
-            totalBytes += chunk.length;
+        recordProcess.stdout?.on('data', (chunk: Buffer) => {
+            const copy = Buffer.allocUnsafe(chunk.length);
+            chunk.copy(copy);
+
+            videoBuffer.push({ time: Date.now(), chunk: copy });
+            totalBytes += copy.length;
 
             const bufferSecs = parseInt(config.bufferTime) || 300;
             const cutoff = Date.now() - (bufferSecs + 15) * 1000;
@@ -207,7 +210,6 @@ function startRecording() {
             }
         });
 
-        recordProcess.stderr?.on('data', (data) => console.log('FFMPEG:', data.toString()));
 
         // Attach error handler on stdin to prevent EPIPE from crashing the app
         // This MUST be set before any writes, otherwise an async write error is uncaught
@@ -252,15 +254,18 @@ function stopRecording() {
     }
 
     if (recordProcess) {
+        const processToKill = recordProcess;
         // Close stdin to signal EOF to FFmpeg's pipe:0 input
-        try { recordProcess.stdin?.end(); } catch (e) { /* ignore */ }
+        try { processToKill.stdin?.end(); } catch (e) { /* ignore */ }
         // Send SIGINT for graceful shutdown (equivalent to pressing 'q')
-        try { recordProcess.kill('SIGINT'); } catch (e) { /* ignore */ }
+        try { processToKill.kill('SIGINT'); } catch (e) { /* ignore */ }
         setTimeout(() => {
-            if (recordProcess) {
-                try { recordProcess.kill('SIGKILL'); } catch (e) { /* ignore */ }
+            if (!processToKill.killed) {
+                try { processToKill.kill('SIGKILL'); } catch (e) { /* ignore */ }
             }
-            recordProcess = null;
+            if (recordProcess === processToKill) {
+                recordProcess = null;
+            }
         }, 3000);
     }
     isRecording = false;
