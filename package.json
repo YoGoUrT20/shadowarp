@@ -1,6 +1,6 @@
 {
   "name": "shadowarp",
-  "version": "1.0.2",
+  "version": "1.0.4",
   "description": "NVIDIA ShadowPlay replica",
   "author": "yogourt20",
   "main": "dist-electron/main/index.js",

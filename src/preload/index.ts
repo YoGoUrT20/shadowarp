@@ -9,8 +9,17 @@ contextBridge.exposeInMainWorld('api', {
     saveReplay: () => ipcRenderer.invoke('save-replay'),
     selectFolder: () => ipcRenderer.invoke('select-folder'),
     windowControl: (action: string) => ipcRenderer.invoke('window-control', action),
-    onRecordingStateChange: (callback: (state: boolean) => void) => ipcRenderer.on('recording-state', (e, state) => callback(state)),
+    onRecordingStateChange: (callback: (state: boolean) => void) => {
+        ipcRenderer.removeAllListeners('recording-state');
+        ipcRenderer.on('recording-state', (_e, state) => callback(state));
+    },
     sendSystemAudioData: (buffer: ArrayBuffer) => ipcRenderer.send('system-audio-data', Buffer.from(buffer)),
-    onStartSystemAudio: (callback: () => void) => ipcRenderer.on('start-system-audio', () => callback()),
-    onStopSystemAudio: (callback: () => void) => ipcRenderer.on('stop-system-audio', () => callback())
+    onStartSystemAudio: (callback: () => void) => {
+        ipcRenderer.removeAllListeners('start-system-audio');
+        ipcRenderer.on('start-system-audio', () => callback());
+    },
+    onStopSystemAudio: (callback: () => void) => {
+        ipcRenderer.removeAllListeners('stop-system-audio');
+        ipcRenderer.on('stop-system-audio', () => callback());
+    }
 });

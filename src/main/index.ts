@@ -29,11 +29,12 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuiting = false;
 let isRecording = false;
+let isStartingRecording = false;
 let recordProcess: ChildProcess | null = null;
 let recordingStartTime = 0;
 let useSystemAudio = false;
+let stdinPaused = false;
 
-// New Memory Architecture for Replay Buffer
 let videoBuffer: { time: number, chunk: Buffer }[] = [];
 let totalBytes = 0;
 
@@ -75,7 +76,8 @@ function ensureDir(dir: string) {
 }
 
 function startRecording() {
-    if (isRecording) return;
+    if (isRecording || isStartingRecording) return;
+    isStartingRecording = true;
     ensureDir(tempDir);
 
     // Clean up old buffer files if they exist
@@ -99,6 +101,7 @@ function startRecording() {
     });
 
     fetchDevices().then((currentDevices) => {
+        if (isRecording) { isStartingRecording = false; return; }
         useSystemAudio = config.systemAudioDevice !== 'None';
 
         const args = [
@@ -202,24 +205,27 @@ function startRecording() {
 
             const bufferSecs = parseInt(config.bufferTime) || 300;
             const cutoff = Date.now() - (bufferSecs + 15) * 1000;
-            const hardLimit = 2.5 * 1024 * 1024 * 1024; // 2.5 GB Safety Limit
+            const hardLimit = 2.5 * 1024 * 1024 * 1024;
 
-            while (videoBuffer.length > 2 && (videoBuffer[0].time < cutoff || totalBytes > hardLimit)) {
-                const removed = videoBuffer.shift();
-                if (removed) totalBytes -= removed.chunk.length;
+            let removeCount = 0;
+            while (removeCount < videoBuffer.length - 2 && (videoBuffer[removeCount].time < cutoff || totalBytes > hardLimit)) {
+                totalBytes -= videoBuffer[removeCount].chunk.length;
+                removeCount++;
+            }
+
+            if (removeCount > 0) {
+                videoBuffer = videoBuffer.slice(removeCount);
             }
         });
 
+        recordProcess.stderr?.on('data', () => {});
 
-        // Attach error handler on stdin to prevent EPIPE from crashing the app
-        // This MUST be set before any writes, otherwise an async write error is uncaught
+        stdinPaused = false;
         if (recordProcess.stdin) {
             recordProcess.stdin.on('error', (err) => {
                 console.warn('FFmpeg stdin error (expected if FFmpeg exited):', err.message);
             });
         }
-
-
 
         recordProcess.on('exit', (code) => {
             console.log('FFmpeg exited with code:', code);
@@ -232,16 +238,18 @@ function startRecording() {
         });
 
         isRecording = true;
+        isStartingRecording = false;
         config.autoRecord = true;
         saveConfigToDisk();
 
         if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('recording-state', true);
-            // Tell renderer to start capturing system audio and pipe PCM to us
             if (useSystemAudio) {
                 mainWindow.webContents.send('start-system-audio');
             }
         }
+    }).catch(() => {
+        isStartingRecording = false;
     });
 }
 
@@ -270,8 +278,12 @@ function stopRecording() {
     }
     isRecording = false;
     useSystemAudio = false;
+    stdinPaused = false;
     config.autoRecord = false;
     saveConfigToDisk();
+
+    videoBuffer = [];
+    totalBytes = 0;
 
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('recording-state', false);
 }
@@ -326,6 +338,7 @@ function saveReplay() {
     };
 
     writeStream.on('finish', () => {
+        chunksCopy.length = 0;
         let stderrOutput = '';
         const extractProcess = spawn(ffmpeg, [
             '-y',
@@ -529,15 +542,16 @@ ipcMain.handle('save-config', (e, newConfig) => {
     saveConfigToDisk();
 });
 
-// Handle system audio PCM data from renderer — write directly to FFmpeg stdin
 ipcMain.on('system-audio-data', (_e, buffer: Buffer) => {
-    if (recordProcess && isRecording && useSystemAudio && recordProcess.stdin && !recordProcess.stdin.destroyed && recordProcess.stdin.writable) {
-        try {
-            recordProcess.stdin.write(buffer);
-        } catch (e) {
-            // Ignore write errors (e.g., if FFmpeg is shutting down)
-            console.warn('Audio write error (FFmpeg may have exited):', (e as Error).message);
+    if (!recordProcess || !isRecording || !useSystemAudio || !recordProcess.stdin || recordProcess.stdin.destroyed || !recordProcess.stdin.writable || stdinPaused) return;
+    try {
+        const ok = recordProcess.stdin.write(buffer);
+        if (!ok) {
+            stdinPaused = true;
+            recordProcess.stdin.once('drain', () => { stdinPaused = false; });
         }
+    } catch (e) {
+        console.warn('Audio write error (FFmpeg may have exited):', (e as Error).message);
     }
 });
 

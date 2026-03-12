@@ -66,15 +66,16 @@ export default function App() {
     const sysAudioStreamRef = useRef<MediaStream | null>(null);
 
     const stopSystemAudioCapture = () => {
-        if (sysAudioCtxRef.current && sysAudioCtxRef.current.state !== 'inactive') {
-            try { sysAudioCtxRef.current.stop(); } catch (e) { }
+        if (sysAudioCtxRef.current) {
+            if (sysAudioCtxRef.current.state !== 'inactive') {
+                try { sysAudioCtxRef.current.stop(); } catch (e) { }
+            }
             sysAudioCtxRef.current = null;
         }
         if (sysAudioStreamRef.current) {
             sysAudioStreamRef.current.getTracks().forEach(t => t.stop());
             sysAudioStreamRef.current = null;
         }
-        console.log('[SysAudio] Capture stopped');
     };
 
     const startSystemAudioCapture = async () => {
