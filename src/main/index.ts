@@ -33,7 +33,6 @@ let isStartingRecording = false;
 let recordProcess: ChildProcess | null = null;
 let recordingStartTime = 0;
 let useSystemAudio = false;
-let stdinPaused = false;
 
 let videoBuffer: { time: number, chunk: Buffer }[] = [];
 let totalBytes = 0;
@@ -220,7 +219,6 @@ function startRecording() {
 
         recordProcess.stderr?.on('data', () => {});
 
-        stdinPaused = false;
         if (recordProcess.stdin) {
             recordProcess.stdin.on('error', (err) => {
                 console.warn('FFmpeg stdin error (expected if FFmpeg exited):', err.message);
@@ -278,7 +276,6 @@ function stopRecording() {
     }
     isRecording = false;
     useSystemAudio = false;
-    stdinPaused = false;
     config.autoRecord = false;
     saveConfigToDisk();
 
@@ -543,13 +540,9 @@ ipcMain.handle('save-config', (e, newConfig) => {
 });
 
 ipcMain.on('system-audio-data', (_e, buffer: Buffer) => {
-    if (!recordProcess || !isRecording || !useSystemAudio || !recordProcess.stdin || recordProcess.stdin.destroyed || !recordProcess.stdin.writable || stdinPaused) return;
+    if (!recordProcess || !isRecording || !useSystemAudio || !recordProcess.stdin || recordProcess.stdin.destroyed || !recordProcess.stdin.writable) return;
     try {
-        const ok = recordProcess.stdin.write(buffer);
-        if (!ok) {
-            stdinPaused = true;
-            recordProcess.stdin.once('drain', () => { stdinPaused = false; });
-        }
+        recordProcess.stdin.write(buffer);
     } catch (e) {
         console.warn('Audio write error (FFmpeg may have exited):', (e as Error).message);
     }
